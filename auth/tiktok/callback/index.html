@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TikTok Authorization Callback — ClipQue</title>
+  <meta name="robots" content="noindex">
+  <link rel="stylesheet" href="/assets/styles.css">
+</head>
+<body>
+  <nav class="nav"><div class="container nav-inner"><a class="logo" href="/"><span class="logo-mark">CQ</span><span>ClipQue</span></a><div class="nav-links"><a href="/privacy-policy/">Privacy</a><a href="/terms-of-service/">Terms</a></div></div></nav>
+  <main class="policy">
+    <div class="container panel">
+      <h1>TikTok authorization callback</h1>
+      <p class="notice">This page is used as the OAuth redirect destination for ClipQue’s TikTok connection flow.</p>
+      <p id="message">Checking authorization result…</p>
+      <div id="codeBox" style="display:none; margin-top:20px;">
+        <p>Authorization code received. Return to ClipQue to finish connecting your account.</p>
+        <p><strong>Authorization code:</strong></p>
+        <p><code id="codeValue"></code></p>
+      </div>
+      <p id="errorBox" style="display:none;"><strong>Authorization error:</strong> <code id="errorValue"></code></p>
+    </div>
+  </main>
+  <script>
+    const params = new URLSearchParams(window.location.search);
+    const code = params.get('code');
+    const error = params.get('error') || params.get('error_description');
+    const msg = document.getElementById('message');
+    if (code) {
+      msg.textContent = 'Authorization was returned to ClipQue.';
+      document.getElementById('codeBox').style.display = 'block';
+      document.getElementById('codeValue').textContent = code;
+    } else if (error) {
+      msg.textContent = 'TikTok returned an authorization error.';
+      document.getElementById('errorBox').style.display = 'block';
+      document.getElementById('errorValue').textContent = error;
+    } else {
+      msg.textContent = 'No authorization code was found. Start the TikTok connection flow from ClipQue.';
+    }
+  </script>
+</body>
+</html>
