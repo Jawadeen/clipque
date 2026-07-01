@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import threading
-import re
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox
@@ -360,7 +359,7 @@ class ClipQueApp:
         db = self.queue_db()
         if not db:
             return
-        for row in sorted(db.list_clips(limit=500), key=self._clip_sort_key):
+        for row in db.list_clips(limit=500):
             status = row.get("status", "")
             tag    = status if status in ("UPLOADED", "FAILED", "UPLOADING") else ""
             self.queue_tree.insert("", "end", values=(
@@ -463,57 +462,17 @@ class ClipQueApp:
             return
         self._post_clips([rows[0]], db)
 
-    def _clip_sort_key(self, row: dict):
-        """Sort clips in the order viewers should see them.
-
-        Handles group names like:
-        - group_01
-        - group_1
-        - Group 01
-        - any name containing a number
-
-        Fallbacks keep sorting stable if a value is missing.
-        """
-        group_name = str(row.get("group_name", "") or "")
-        match = re.search(r"(\d+)", group_name)
-        group_num = int(match.group(1)) if match else 999999
-
-        try:
-            part_num = int(row.get("part_number", 999999) or 999999)
-        except (TypeError, ValueError):
-            part_num = 999999
-
-        try:
-            row_id = int(row.get("id", 999999) or 999999)
-        except (TypeError, ValueError):
-            row_id = 999999
-
-        return (group_num, part_num, row_id)
-
     def post_all_ready(self):
         db = self.queue_db()
         if not db:
             messagebox.showerror("Error", "No queue database found.")
             return
-
         ready = [r for r in db.list_clips(limit=1000) if r["status"] == "READY"]
-        ready = sorted(ready, key=self._clip_sort_key)
-
         if not ready:
             messagebox.showinfo("Nothing to post", "No clips with status READY in the queue.")
             return
-
-        first = ready[0]
-        last = ready[-1]
-        order_msg = (
-            f"Post {len(ready)} clip(s) to TikTok in order?\n\n"
-            f"First: {first.get('group_name')} part {first.get('part_number')}\n"
-            f"Last: {last.get('group_name')} part {last.get('part_number')}"
-        )
-
-        if not messagebox.askyesno("Post all READY", order_msg):
+        if not messagebox.askyesno("Post all READY", f"Post {len(ready)} clip(s) to TikTok?"):
             return
-
         self._post_clips(ready, db)
 
     def _post_clips(self, clips: list[dict], db: ClipQueueDB):

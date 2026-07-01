@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import random
 import time
 import urllib.error
 import urllib.parse
@@ -23,6 +24,13 @@ TIKTOK_VIDEO_STATUS_URL = "https://open.tiktokapis.com/v2/post/publish/status/fe
 MIN_CHUNK_SIZE_BYTES = 5 * 1024 * 1024  # TikTok minimum normal chunk size
 SINGLE_CHUNK_LIMIT_BYTES = 64 * 1024 * 1024  # TikTok maximum normal chunk size
 MULTI_CHUNK_SIZE_BYTES = 32 * 1024 * 1024  # Safe chunk size for multi-part uploads
+
+# TikTok's Direct Post initialize endpoint is limited to 6 requests per minute
+# per user access token. One request every 12 seconds gives a safety buffer.
+TIKTOK_DIRECT_POST_MIN_GAP_SECONDS = 12.0
+TIKTOK_CREATOR_INFO_CACHE_SECONDS = 10 * 60
+TIKTOK_429_DEFAULT_WAIT_SECONDS = 70.0
+TIKTOK_MAX_429_RETRIES = 4
 
 
 @dataclass
@@ -107,10 +115,17 @@ class TikTokClient:
     - upload_clip() — query creator info, initialize Direct Post, upload chunks, poll status
     - refresh_token() — renew an expired access token using the saved refresh token
     - disconnect() — wipe all stored tokens
+
+    Rate-limit fix:
+    TikTok Direct Post init is limited to 6 requests/minute per access token.
+    This client now spaces init calls, caches creator_info, and retries 429s.
     """
 
     def __init__(self, token_store: TikTokTokenStore | None = None):
         self.token_store = token_store or TikTokTokenStore()
+        self._last_direct_post_init_at = 0.0
+        self._creator_info_cache: dict | None = None
+        self._creator_info_cache_at = 0.0
 
     # ── Auth status ───────────────────────────────────────────────────────
     def auth_status(self) -> TikTokAuthState:
@@ -162,8 +177,7 @@ class TikTokClient:
         if file_size <= 0:
             raise RuntimeError(f"Video file is empty: {video_file}")
 
-        log("Querying TikTok creator info…")
-        creator_info = self.query_creator_info(token)
+        creator_info = self.query_creator_info(token, log_callback=log)
         privacy_level = self._choose_privacy_level(creator_info)
         log(f"Using TikTok privacy level: {privacy_level}")
 
@@ -173,6 +187,7 @@ class TikTokClient:
             f"chunk_size={chunk_size} bytes, total_chunk_count={total_chunk_count}"
         )
 
+        self._wait_for_direct_post_slot(log)
         log(f"Initialising TikTok upload for {video_file.name}…")
 
         init_body = json.dumps(
@@ -198,6 +213,9 @@ class TikTokClient:
             token=token,
             body=init_body,
             content_type="application/json; charset=utf-8",
+            log_callback=log,
+            retry_429=True,
+            update_init_timestamp=True,
         )
 
         upload_url = init_resp["data"]["upload_url"]
@@ -246,13 +264,15 @@ class TikTokClient:
         log("All chunks uploaded. Waiting for TikTok to process…")
 
         for attempt in range(20):
-            time.sleep(3)
+            time.sleep(5)
             status_body = json.dumps({"publish_id": publish_id}).encode("utf-8")
             status_resp = self._api_post(
                 TIKTOK_VIDEO_STATUS_URL,
                 token=token,
                 body=status_body,
                 content_type="application/json; charset=utf-8",
+                log_callback=log,
+                retry_429=True,
             )
 
             data = status_resp.get("data", {})
@@ -269,13 +289,27 @@ class TikTokClient:
 
         raise RuntimeError("Timed out waiting for TikTok to publish the video.")
 
-    def query_creator_info(self, token: str) -> dict:
-        return self._api_post(
+    def query_creator_info(self, token: str, log_callback=None) -> dict:
+        now = time.monotonic()
+        if self._creator_info_cache and (now - self._creator_info_cache_at) < TIKTOK_CREATOR_INFO_CACHE_SECONDS:
+            if log_callback:
+                log_callback("Using cached TikTok creator info…")
+            return self._creator_info_cache
+
+        if log_callback:
+            log_callback("Querying TikTok creator info…")
+
+        data = self._api_post(
             TIKTOK_CREATOR_INFO_URL,
             token=token,
             body=b"{}",
             content_type="application/json; charset=utf-8",
+            log_callback=log_callback,
+            retry_429=True,
         )
+        self._creator_info_cache = data
+        self._creator_info_cache_at = time.monotonic()
+        return data
 
     @staticmethod
     def _choose_privacy_level(creator_info: dict) -> str:
@@ -375,28 +409,91 @@ class TikTokClient:
     def disconnect(self) -> None:
         self.token_store.disconnect()
 
-    # ── Internals ─────────────────────────────────────────────────────────
-    def _api_post(self, url: str, token: str, body: bytes, content_type: str) -> dict:
-        req = urllib.request.Request(url, data=body, method="POST")
-        req.add_header("Authorization", f"Bearer {token}")
-        req.add_header("Content-Type", content_type)
-        req.add_header("Content-Length", str(len(body)))
+    # ── Rate limit helpers ────────────────────────────────────────────────
+    def _wait_for_direct_post_slot(self, log_callback=None) -> None:
+        elapsed = time.monotonic() - self._last_direct_post_init_at
+        wait_for = TIKTOK_DIRECT_POST_MIN_GAP_SECONDS - elapsed
+        if wait_for > 0:
+            if log_callback:
+                log_callback(f"TikTok rate-limit guard: waiting {wait_for:.1f}s before next upload init…")
+            time.sleep(wait_for)
 
+    @staticmethod
+    def _retry_after_seconds(exc: urllib.error.HTTPError) -> float:
+        header = None
         try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
+            header = exc.headers.get("Retry-After")
+        except Exception:
+            header = None
+
+        if header:
             try:
-                detail = exc.read().decode("utf-8")[:500]
-            except Exception:
-                detail = str(exc)
-            raise RuntimeError(f"TikTok API error {exc.code}: {detail}") from exc
+                return max(1.0, float(header))
+            except ValueError:
+                pass
 
-        err = data.get("error", {})
-        if isinstance(err, dict) and err.get("code", "ok") != "ok":
-            raise RuntimeError(f"TikTok API: {err.get('code')} — {err.get('message')}")
+        return TIKTOK_429_DEFAULT_WAIT_SECONDS + random.uniform(0, 5)
 
-        return data
+    # ── Internals ─────────────────────────────────────────────────────────
+    def _api_post(
+        self,
+        url: str,
+        token: str,
+        body: bytes,
+        content_type: str,
+        log_callback=None,
+        retry_429: bool = True,
+        update_init_timestamp: bool = False,
+    ) -> dict:
+        for attempt in range(TIKTOK_MAX_429_RETRIES + 1):
+            req = urllib.request.Request(url, data=body, method="POST")
+            req.add_header("Authorization", f"Bearer {token}")
+            req.add_header("Content-Type", content_type)
+            req.add_header("Content-Length", str(len(body)))
+
+            try:
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+
+                if update_init_timestamp:
+                    self._last_direct_post_init_at = time.monotonic()
+
+                err = data.get("error", {})
+                if isinstance(err, dict) and err.get("code", "ok") not in ("ok", ""):
+                    code = err.get("code", "")
+                    message = err.get("message", "")
+                    if code == "rate_limit_exceeded" and retry_429 and attempt < TIKTOK_MAX_429_RETRIES:
+                        wait_for = TIKTOK_429_DEFAULT_WAIT_SECONDS + random.uniform(0, 5)
+                        if log_callback:
+                            log_callback(
+                                f"TikTok rate limit hit. Waiting {wait_for:.1f}s then retrying "
+                                f"({attempt + 1}/{TIKTOK_MAX_429_RETRIES})…"
+                            )
+                        time.sleep(wait_for)
+                        continue
+                    raise RuntimeError(f"TikTok API: {code} — {message}")
+
+                return data
+
+            except urllib.error.HTTPError as exc:
+                try:
+                    detail = exc.read().decode("utf-8")[:500]
+                except Exception:
+                    detail = str(exc)
+
+                if exc.code == 429 and retry_429 and attempt < TIKTOK_MAX_429_RETRIES:
+                    wait_for = self._retry_after_seconds(exc)
+                    if log_callback:
+                        log_callback(
+                            f"TikTok API rate limit reached. Waiting {wait_for:.1f}s then retrying "
+                            f"({attempt + 1}/{TIKTOK_MAX_429_RETRIES})…"
+                        )
+                    time.sleep(wait_for)
+                    continue
+
+                raise RuntimeError(f"TikTok API error {exc.code}: {detail}") from exc
+
+        raise RuntimeError("TikTok API rate limit kept happening after all retries. Try again later.")
 
     def _get_user_info(self, token: str) -> dict:
         req = urllib.request.Request(
