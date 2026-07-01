@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import math
 import time
 import urllib.error
 import urllib.parse
@@ -21,7 +20,9 @@ TIKTOK_CREATOR_INFO_URL = "https://open.tiktokapis.com/v2/post/publish/creator_i
 TIKTOK_VIDEO_INIT_URL = "https://open.tiktokapis.com/v2/post/publish/video/init/"
 TIKTOK_VIDEO_STATUS_URL = "https://open.tiktokapis.com/v2/post/publish/status/fetch/"
 
-CHUNK_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB per upload chunk
+MIN_CHUNK_SIZE_BYTES = 5 * 1024 * 1024  # TikTok minimum normal chunk size
+SINGLE_CHUNK_LIMIT_BYTES = 64 * 1024 * 1024  # TikTok maximum normal chunk size
+MULTI_CHUNK_SIZE_BYTES = 32 * 1024 * 1024  # Safe chunk size for multi-part uploads
 
 
 @dataclass
@@ -166,10 +167,11 @@ class TikTokClient:
         privacy_level = self._choose_privacy_level(creator_info)
         log(f"Using TikTok privacy level: {privacy_level}")
 
-        # TikTok requires files under 5 MB to be uploaded as one whole chunk with
-        # chunk_size equal to the entire video size.
-        chunk_size = min(CHUNK_SIZE_BYTES, file_size)
-        total_chunk_count = math.ceil(file_size / chunk_size)
+        chunk_size, total_chunk_count = self._calculate_upload_plan(file_size)
+        log(
+            f"TikTok upload plan: video_size={file_size} bytes, "
+            f"chunk_size={chunk_size} bytes, total_chunk_count={total_chunk_count}"
+        )
 
         log(f"Initialising TikTok upload for {video_file.name}…")
 
@@ -204,11 +206,27 @@ class TikTokClient:
 
         with video_file.open("rb") as fh:
             for chunk_index in range(total_chunk_count):
-                chunk_data = fh.read(chunk_size)
                 chunk_start = chunk_index * chunk_size
+                if chunk_index == total_chunk_count - 1:
+                    # TikTok's rule is unusual: total_chunk_count is floor(video_size / chunk_size),
+                    # and the final chunk absorbs all trailing bytes. Do not use ceil().
+                    bytes_to_read = file_size - chunk_start
+                else:
+                    bytes_to_read = chunk_size
+
+                chunk_data = fh.read(bytes_to_read)
+                if len(chunk_data) != bytes_to_read:
+                    raise RuntimeError(
+                        f"Could not read expected TikTok chunk bytes: "
+                        f"wanted {bytes_to_read}, got {len(chunk_data)}"
+                    )
+
                 chunk_end = chunk_start + len(chunk_data) - 1
 
-                log(f"Uploading chunk {chunk_index + 1}/{total_chunk_count}…")
+                log(
+                    f"Uploading chunk {chunk_index + 1}/{total_chunk_count} "
+                    f"bytes {chunk_start}-{chunk_end}/{file_size}…"
+                )
 
                 req = urllib.request.Request(upload_url, data=chunk_data, method="PUT")
                 req.add_header("Content-Type", "video/mp4")
@@ -267,6 +285,46 @@ class TikTokClient:
         if options:
             return options[0]
         return "SELF_ONLY"
+
+    @staticmethod
+    def _calculate_upload_plan(file_size: int) -> tuple[int, int]:
+        """Return (chunk_size, total_chunk_count) using TikTok's exact rules.
+
+        TikTok's Content Posting API does NOT want ceil(video_size / chunk_size).
+        It wants total_chunk_count to be floor(video_size / chunk_size), with the
+        last uploaded chunk containing chunk_size plus any trailing bytes.
+
+        For files up to 64 MiB we use a single whole-file upload. For larger
+        files, 32 MiB chunks keep every normal chunk within TikTok's 5–64 MB
+        range and keep the final absorbed chunk safely below 128 MB.
+        """
+        if file_size <= 0:
+            raise RuntimeError("Video file is empty.")
+
+        if file_size <= SINGLE_CHUNK_LIMIT_BYTES:
+            return file_size, 1
+
+        chunk_size = MULTI_CHUNK_SIZE_BYTES
+        total_chunk_count = file_size // chunk_size  # TikTok requires floor(), not ceil()
+
+        if total_chunk_count < 2:
+            # Defensive fallback for any future constant changes. Videos greater
+            # than 64 MB must be uploaded in multiple chunks.
+            chunk_size = file_size // 2
+            total_chunk_count = 2
+
+        if total_chunk_count > 1000:
+            raise RuntimeError(
+                f"Video needs {total_chunk_count} chunks, but TikTok allows a maximum of 1000."
+            )
+
+        final_chunk_size = file_size - ((total_chunk_count - 1) * chunk_size)
+        if not (MIN_CHUNK_SIZE_BYTES <= chunk_size <= SINGLE_CHUNK_LIMIT_BYTES):
+            raise RuntimeError(f"Calculated invalid TikTok chunk size: {chunk_size}")
+        if final_chunk_size > 128 * 1024 * 1024:
+            raise RuntimeError(f"Calculated final TikTok chunk is too large: {final_chunk_size}")
+
+        return chunk_size, total_chunk_count
 
     # ── Token refresh ─────────────────────────────────────────────────────
     def refresh_token(self, client_key: str, client_secret: str) -> bool:
