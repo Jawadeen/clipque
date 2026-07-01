@@ -1,9 +1,0 @@
-# Set these in Netlify dashboard: Site settings -> Environment variables
-# Do NOT commit real values to this file or to git.
-
-# From TikTok Developer Portal (use sandbox values while pre-approval)
-TIKTOK_CLIENT_KEY=your_client_key_here
-TIKTOK_CLIENT_SECRET=your_client_secret_here
-
-# Must exactly match what's registered as the Redirect URI in the Developer Portal
-TIKTOK_REDIRECT_URI=https://clipque.netlify.app/.netlify/functions/tiktok-callback
